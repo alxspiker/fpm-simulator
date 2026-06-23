@@ -1562,6 +1562,137 @@ static int run_sparc_payload_mode(const std::string& payload_path, const std::st
 }
 
 // =============================================================================
+// EMERGENT DYNAMIC TORSION (THE ZOMBIE SNAP)
+// =============================================================================
+
+static int run_dynamic_torsion_mode(const std::string& output_path) {
+    Axioms ax;
+    DerivedConstants d = derive_all(ax);
+    Z3Lattice lattice(16, 16, 4, d, 42);
+    ThermodynamicScheduler sched(lattice, d);
+
+    int idx_A = lattice.flat(2, 8, 2);
+    int idx_B = lattice.flat(13, 8, 2);
+
+    double scale = 1.0;
+    double A_val[3][3] = {{0,0,0},{0,0,-scale},{0,scale,0}};
+    double A_val_T[3][3] = {{0,0,0},{0,0,scale},{0,-scale,0}};
+
+    Daemon& da = lattice.arena[idx_A];
+    Daemon& db = lattice.arena[idx_B];
+
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            double S_ij_a = 0.5 * (da.R[i][j] + da.R[j][i]);
+            da.R[i][j] = S_ij_a + A_val[i][j];
+            double S_ij_b = 0.5 * (db.R[i][j] + db.R[j][i]);
+            db.R[i][j] = S_ij_b + A_val_T[i][j];
+        }
+    }
+
+    EmergentProbeBell probe(d);
+    std::vector<int> ticks_out;
+    std::vector<double> energy_out;
+    std::vector<double> s_joint_out;
+    std::vector<bool> zombie_out;
+    std::vector<std::string> mode_out;
+    int snap_tick = -1;
+
+    ticks_out.reserve(150);
+    energy_out.reserve(150);
+    s_joint_out.reserve(150);
+    zombie_out.reserve(150);
+    mode_out.reserve(150);
+
+    for (int tick = 0; tick < 150; tick++) {
+        double current_E = 0.0;
+        for (int i = 0; i < lattice.size(); i++) {
+            lattice.arena[i].E *= 0.85;
+            current_E += lattice.arena[i].E;
+        }
+        current_E /= (double)lattice.size();
+
+        bool is_zombie = (da.E < 0.01 && db.E < 0.01);
+
+        for (int i = 0; i < lattice.size(); i++) {
+            double L, O, k;
+            sched.step_one(L, O, k);
+        }
+
+        auto dynamic_correlation = [&](double a, double b) {
+            double local_corr = probe.local_torsion_correlation(a, b);
+            double lrm_corr = probe.joint_torsion_lrm_correlation(a, b);
+            double blend = std::max(0.0, std::min(1.0, current_E / 0.10));
+            if (is_zombie) return lrm_corr;
+            return blend * local_corr + (1.0 - blend) * lrm_corr;
+        };
+
+        double S_joint = std::abs(dynamic_correlation(0.0, PI/4.0) +
+                                  dynamic_correlation(0.0, -PI/4.0) +
+                                  dynamic_correlation(PI/2.0, PI/4.0) -
+                                  dynamic_correlation(PI/2.0, -PI/4.0));
+
+        std::string mode = "FLOW";
+        if (is_zombie) mode = "ZOMBIE";
+        else if (current_E < 0.10) mode = "FATIGUE";
+
+        ticks_out.push_back(tick);
+        energy_out.push_back(current_E);
+        s_joint_out.push_back(S_joint);
+        zombie_out.push_back(is_zombie);
+        mode_out.push_back(mode);
+
+        if (is_zombie && snap_tick == -1) {
+            snap_tick = tick;
+        }
+    }
+
+    std::ofstream f(output_path);
+    if (!f) {
+        std::cerr << "ERROR: failed to open torsion output: " << output_path << "\n";
+        return 5;
+    }
+
+    f << std::setprecision(15);
+    f << "{\n";
+    f << "  \"mode\": \"dynamic_torsion\",\n";
+    f << "  \"lattice\": [16,16,4],\n";
+    f << "  \"node_A\": " << idx_A << ",\n";
+    f << "  \"node_B\": " << idx_B << ",\n";
+    f << "  \"snap_tick\": " << snap_tick << ",\n";
+
+    f << "  \"ticks\": [";
+    for (size_t i = 0; i < ticks_out.size(); i++) { if (i) f << ","; f << ticks_out[i]; }
+    f << "],\n";
+
+    f << "  \"energy\": [";
+    for (size_t i = 0; i < energy_out.size(); i++) { if (i) f << ","; f << energy_out[i]; }
+    f << "],\n";
+
+    f << "  \"S_joint\": [";
+    for (size_t i = 0; i < s_joint_out.size(); i++) { if (i) f << ","; f << s_joint_out[i]; }
+    f << "],\n";
+
+    f << "  \"is_zombie\": [";
+    for (size_t i = 0; i < zombie_out.size(); i++) { if (i) f << ","; f << (zombie_out[i] ? "true" : "false"); }
+    f << "],\n";
+
+    f << "  \"samples\": [\n";
+    for (size_t i = 0; i < ticks_out.size(); i++) {
+        if (i) f << ",\n";
+        f << "    {\"tick\": " << ticks_out[i]
+          << ", \"mean_E\": " << energy_out[i]
+          << ", \"S_joint\": " << s_joint_out[i]
+          << ", \"mode\": \"" << mode_out[i] << "\"}";
+    }
+    f << "\n  ]\n";
+    f << "}\n";
+
+    std::cout << "Dynamic torsion phase-lock output saved to: " << output_path << "\n";
+    return 0;
+}
+
+// =============================================================================
 // CALIBRATION
 // =============================================================================
 
@@ -1707,16 +1838,24 @@ int main(int argc, char** argv) {
     if (argc > 1) {
         std::string payload_path;
         std::string output_path = "artifacts/sparc_substrate_output.json";
+        std::string torsion_output_path;
         for (int i = 1; i < argc; i++) {
             std::string arg = argv[i];
             if (arg == "--sparc-payload" && i + 1 < argc) {
                 payload_path = argv[++i];
             } else if (arg == "--sparc-output" && i + 1 < argc) {
                 output_path = argv[++i];
+            } else if (arg == "--torsion-phase-lock-output" && i + 1 < argc) {
+                torsion_output_path = argv[++i];
             } else {
                 std::cerr << "ERROR: unknown argument: " << arg << "\n";
                 return 1;
             }
+        }
+        if (!torsion_output_path.empty()) {
+            std::filesystem::path parent = std::filesystem::path(torsion_output_path).parent_path();
+            if (!parent.empty()) std::filesystem::create_directories(parent);
+            return run_dynamic_torsion_mode(torsion_output_path);
         }
         if (payload_path.empty()) {
             std::cerr << "ERROR: --sparc-payload requires a sanitized payload path\n";

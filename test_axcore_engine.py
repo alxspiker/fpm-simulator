@@ -11,6 +11,7 @@ SPARC data availability, and reports macroscopic scaling estimates.
 Usage:
   python test_axcore_engine.py
   python test_axcore_engine.py --skip-run
+  python test_axcore_engine.py --dynamic-torsion
   python test_axcore_engine.py --sparc-dir "C:\\path\\to\\local_data"
 """
 
@@ -41,6 +42,7 @@ ARTIFACT_DIR = ROOT / "artifacts"
 RESULTS_JSON = ARTIFACT_DIR / "fpm_axcore_results.json"
 SPARC_PAYLOAD_JSON = ARTIFACT_DIR / "sparc_injection_payload.json"
 SPARC_SUBSTRATE_JSON = ARTIFACT_DIR / "sparc_substrate_output.json"
+TORSION_PHASE_LOCK_JSON = ARTIFACT_DIR / "torsion_phase_lock.json"
 SIM_EXE = ROOT / "build" / "fpm_axcore.exe"
 SPARC_BASE_URL = "https://astroweb.case.edu/SPARC"
 SPARC_TABLE_URL = f"{SPARC_BASE_URL}/SPARC_Lelli2016c.mrt"
@@ -292,6 +294,12 @@ def fit_scaled_rmse(v_obs: list[float], v_raw: list[float]) -> tuple[float, floa
     return scale, rmse, rmse / mean_obs
 
 
+def launch_cpp_with_runtime(args: list[str], *, timeout: int = 180) -> subprocess.CompletedProcess[str]:
+    quoted_args = " ".join(f"'{arg}'" for arg in args)
+    ps_command = "$env:Path='C:\\msys64\\mingw64\\bin;' + $env:Path; & " + quoted_args
+    return run_command(["powershell", "-NoProfile", "-Command", ps_command], timeout=timeout)
+
+
 def run_compile_and_simulator(skip_run: bool) -> list[Check]:
     checks: list[Check] = []
     if not COMPILE_SCRIPT.exists():
@@ -498,12 +506,16 @@ def check_sparc_substrate_ipc(sparc_dir: Path) -> list[Check]:
         return [Check("DDO154 SPARC payload source parses", False, str(rotmod))]
 
     write_sanitized_sparc_payload("DDO154", points)
-    ps_command = (
-        "$env:Path='C:\\msys64\\mingw64\\bin;' + $env:Path; "
-        f"& '{SIM_EXE}' --sparc-payload '{SPARC_PAYLOAD_JSON}' "
-        f"--sparc-output '{SPARC_SUBSTRATE_JSON}'"
+    run = launch_cpp_with_runtime(
+        [
+            str(SIM_EXE),
+            "--sparc-payload",
+            str(SPARC_PAYLOAD_JSON),
+            "--sparc-output",
+            str(SPARC_SUBSTRATE_JSON),
+        ],
+        timeout=180,
     )
-    run = run_command(["powershell", "-NoProfile", "-Command", ps_command], timeout=180)
     checks.append(
         Check(
             "C++ substrate accepts sanitized SPARC payload",
@@ -549,6 +561,85 @@ def check_sparc_substrate_ipc(sparc_dir: Path) -> list[Check]:
                 f"galaxy=DDO154 scale={scale:.6g} rmse={rmse:.2f} km/s normalized={nrmse:.3f}",
             )
         )
+    return checks
+
+
+def check_dynamic_torsion_phase_lock() -> list[Check]:
+    checks: list[Check] = []
+    if not SIM_EXE.exists():
+        return [Check("dynamic torsion executable exists", False, str(SIM_EXE))]
+
+    if TORSION_PHASE_LOCK_JSON.exists():
+        TORSION_PHASE_LOCK_JSON.unlink()
+
+    run = launch_cpp_with_runtime(
+        [
+            str(SIM_EXE),
+            "--torsion-phase-lock-output",
+            str(TORSION_PHASE_LOCK_JSON),
+        ],
+        timeout=180,
+    )
+    checks.append(
+        Check(
+            "C++ dynamic torsion phase-lock mode runs",
+            run.returncode == 0 and TORSION_PHASE_LOCK_JSON.exists(),
+            "torsion trace produced"
+            if run.returncode == 0 and TORSION_PHASE_LOCK_JSON.exists()
+            else (run.stdout[-1400:] or f"exit={run.returncode}; expected --torsion-phase-lock-output support"),
+        )
+    )
+    if run.returncode != 0 or not TORSION_PHASE_LOCK_JSON.exists():
+        return checks
+
+    with TORSION_PHASE_LOCK_JSON.open("r", encoding="utf-8") as f:
+        trace = json.load(f)
+
+    samples = trace.get("samples", [])
+    s_joint = [float(s.get("S_joint", 0.0)) for s in samples]
+    energy = [float(s.get("mean_E", 0.0)) for s in samples]
+    modes = [str(s.get("mode", "")) for s in samples]
+    snap_tick = trace.get("snap_tick")
+    tsirelson = 2.0 * math.sqrt(2.0)
+
+    crossing = next((i for i, s in enumerate(s_joint) if s > 2.0), None)
+    final_s = s_joint[-1] if s_joint else 0.0
+    max_s = max(s_joint) if s_joint else 0.0
+
+    checks.extend(
+        [
+            Check(
+                "dynamic torsion trace has enough universal ticks",
+                len(samples) >= 32,
+                f"samples={len(samples)}",
+            ),
+            Check(
+                "starvation energy decays over trace",
+                len(energy) >= 2 and energy[-1] < energy[0],
+                f"E_start={energy[0] if energy else 'n/a'} E_end={energy[-1] if energy else 'n/a'}",
+            ),
+            Check(
+                "ZOMBIE snap tick is recorded",
+                isinstance(snap_tick, int) and snap_tick >= 0,
+                f"snap_tick={snap_tick}",
+            ),
+            Check(
+                "S_joint crosses classical bound",
+                crossing is not None,
+                f"first_crossing_index={crossing} max_S={max_s}",
+            ),
+            Check(
+                "S_joint stabilizes near Tsirelson bound",
+                abs(final_s - tsirelson) < 0.02 and max_s <= tsirelson + 0.05,
+                f"final_S={final_s} max_S={max_s} Tsirelson={tsirelson}",
+            ),
+            Check(
+                "trace records starvation/ZOMBIE mode",
+                any(mode.upper() == "ZOMBIE" for mode in modes),
+                f"modes={sorted(set(modes))}",
+            ),
+        ]
+    )
     return checks
 
 
@@ -599,6 +690,11 @@ def main() -> int:
     parser.add_argument("--skip-run", action="store_true", help="Compile only; do not run simulator twice.")
     parser.add_argument("--skip-build", action="store_true", help="Skip compile/run and only inspect current files.")
     parser.add_argument(
+        "--dynamic-torsion",
+        action="store_true",
+        help="Run the dynamic torsion phase-lock contract test. Requires C++ --torsion-phase-lock-output support.",
+    )
+    parser.add_argument(
         "--sparc-dir",
         type=Path,
         default=None,
@@ -625,6 +721,8 @@ def main() -> int:
                 str(downloaded_sparc_dir),
             )
         )
+    if args.dynamic_torsion:
+        checks.extend(check_dynamic_torsion_phase_lock())
     checks.extend(check_scaling_estimate())
     return print_results(checks)
 
