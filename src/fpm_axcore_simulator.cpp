@@ -20,7 +20,7 @@
 //
 // Compile: g++ -O2 -std=c++17 -fopenmp -o fpm_axcore fpm_axcore_simulator.cpp -lm
 // Run:     ./fpm_axcore
-// Output:  fpm_axcore_results.json
+// Output:  artifacts/fpm_axcore_results.json
 //
 // Author: built from the FPM paper by Alx Spiker.
 // C++ AxCore port: emergent lattice mechanics per AxCore specification.
@@ -44,6 +44,7 @@
 #include <iostream>
 #include <iomanip>
 #include <string>
+#include <filesystem>
 
 #if defined(_MSC_VER)
 #include <intrin.h>
@@ -1662,7 +1663,8 @@ int main() {
     std::cout << "    Tick ratio: " << tick_ratio << "\n\n";
 
     // Write JSON
-    std::string json_path = "fpm_axcore_results.json";
+    std::filesystem::create_directories("artifacts");
+    std::string json_path = "artifacts/fpm_axcore_results.json";
     write_json(json_path, ax, d, cal,
                t_hist, total_E_hist, mean_L_hist, mean_Omega_hist, active_frac_hist,
                S_local, S_qm, S_torsion, S_joint, bell_verdict,

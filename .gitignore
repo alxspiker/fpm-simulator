@@ -1,4 +1,2 @@
 build/
 *.exe
-fpm_axcore_results.json
-fpm_emergent_charts/

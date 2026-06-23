@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 FPM AxCore -- Visualization Companion
-Reads fpm_axcore_results.json (produced by the C++ simulator) and generates
+Reads artifacts/fpm_axcore_results.json (produced by the C++ simulator) and generates
 all PNG charts. Run after the C++ simulator completes.
 
 Usage:  python fpm_axcore_plots.py [path_to_json]
@@ -16,11 +16,17 @@ plt.rcParams["font.sans-serif"] = ["DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 plt.rcParams["figure.dpi"] = 110
 
-def load_json(path="fpm_axcore_results.json"):
+ARTIFACT_DIR = "artifacts"
+DEFAULT_JSON_PATH = os.path.join(ARTIFACT_DIR, "fpm_axcore_results.json")
+
+def default_json_path():
+    return DEFAULT_JSON_PATH if os.path.exists(DEFAULT_JSON_PATH) else "fpm_axcore_results.json"
+
+def load_json(path=DEFAULT_JSON_PATH):
     with open(path) as f:
         return json.load(f)
 
-def plot_all(data, out_dir="fpm_emergent_charts"):
+def plot_all(data, out_dir=ARTIFACT_DIR):
     os.makedirs(out_dir, exist_ok=True)
     paths = {}
     d = data.get("derived_constants", {})
@@ -185,9 +191,10 @@ def plot_all(data, out_dir="fpm_emergent_charts"):
     return paths
 
 if __name__ == "__main__":
-    json_path = sys.argv[1] if len(sys.argv) > 1 else "fpm_axcore_results.json"
+    json_path = sys.argv[1] if len(sys.argv) > 1 else default_json_path()
     data = load_json(json_path)
-    paths = plot_all(data)
+    out_dir = os.path.dirname(json_path) or ARTIFACT_DIR
+    paths = plot_all(data, out_dir=out_dir)
     print("Charts generated:")
     for k, p in paths.items():
         print(f"  {k:20s}: {p}")
