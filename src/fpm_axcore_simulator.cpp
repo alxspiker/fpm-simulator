@@ -10,7 +10,7 @@
 //      no Python objects. Tightly packed struct: psi[9], E, b, R[3][3], etc.
 //   2. BITWISE ADJACENCY: 6-face Z^3 neighbors resolved via flat-index modulo
 //      arithmetic. flat(x,y,z) = x*sy*sz + y*sz + z. No hash maps.
-//   3. EVENT SCHEDULER: std::priority_queue maps (next_time, flat_idx) to
+//   3. EVENT SCHEDULER: radix heap maps (next_step, flat_idx) to
 //      daemon memory offsets. Daemons buy ticks with FPM currency.
 //   4. EXACT N_bit_eq: Triple loop over Z^3 lattice points within alpha_PP
 //      sphere. ~1.2 seconds in compiled C++. No continuous approximation.
@@ -32,10 +32,11 @@
 #include <cstring>
 #include <cassert>
 #include <vector>
-#include <queue>
 #include <algorithm>
 #include <numeric>
 #include <complex>
+#include <cstdint>
+#include <limits>
 #include <functional>
 #include <random>
 #include <fstream>
@@ -43,6 +44,10 @@
 #include <iostream>
 #include <iomanip>
 #include <string>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 // =============================================================================
 // Physical constants (CODATA / SI)
@@ -62,6 +67,236 @@ static const double PLANCK_NS  = 0.965;
 static const double PLANCK_RATIO_LCDM = 5.357;
 static const double PLANCK_TT_RMS     = 4.06e-5;
 static const double CERN_MUON_GAMMA   = 29.3;
+
+// =============================================================================
+// DETERMINISTIC FAST-MATH KERNEL
+// =============================================================================
+
+inline double det_abs(double x) {
+    return x < 0.0 ? -x : x;
+}
+
+inline double det_rsqrt(double number) {
+    if (number <= 0.0) return 0.0;
+
+    double y = number;
+    double x2 = y * 0.5;
+    uint64_t bits = 0;
+    std::memcpy(&bits, &y, sizeof(bits));
+    bits = 0x5fe6eb50c7b537a9ULL - (bits >> 1);
+    std::memcpy(&y, &bits, sizeof(y));
+
+    // Four fixed Newton steps tighten the 64-bit seed without libc calls.
+    y = y * (1.5 - (x2 * y * y));
+    y = y * (1.5 - (x2 * y * y));
+    y = y * (1.5 - (x2 * y * y));
+    y = y * (1.5 - (x2 * y * y));
+    return y;
+}
+
+inline double det_sqrt(double number) {
+    return number <= 0.0 ? 0.0 : number * det_rsqrt(number);
+}
+
+inline double det_pow2_int(int exp) {
+    if (exp < -1022) return 0.0;
+    if (exp > 1023) exp = 1023;
+
+    uint64_t bits = (uint64_t)(exp + 1023) << 52;
+    double value = 0.0;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+inline double det_log2(double x) {
+    if (x <= 0.0) return -1024.0;
+
+    uint64_t bits = 0;
+    std::memcpy(&bits, &x, sizeof(bits));
+    int exp = (int)((bits >> 52) & 0x7ff) - 1023;
+
+    // The hot-path probabilities are normal doubles. Keep subnormal handling
+    // deterministic anyway by scaling into the normal range before extraction.
+    if (exp == -1023) {
+        x *= det_pow2_int(54);
+        std::memcpy(&bits, &x, sizeof(bits));
+        exp = (int)((bits >> 52) & 0x7ff) - 1023 - 54;
+    }
+
+    uint64_t mant_bits = (bits & 0x000fffffffffffffULL) | (1023ULL << 52);
+    double m = 0.0;
+    std::memcpy(&m, &mant_bits, sizeof(m));
+
+    static const double INV_LN2 = 1.44269504088896340736;
+    double z = (m - 1.0) / (m + 1.0);
+    double z2 = z * z;
+    double term = z;
+    double sum = term;
+    for (int denom = 3; denom <= 31; denom += 2) {
+        term *= z2;
+        sum += term / (double)denom;
+    }
+
+    return (double)exp + (2.0 * sum * INV_LN2);
+}
+
+inline double det_root5(double x) {
+    if (x <= 0.0) return 0.0;
+    double y = 1.0;
+    for (int i = 0; i < 10; i++) {
+        double y2 = y * y;
+        double y4 = y2 * y2;
+        y = 0.2 * (4.0 * y + x / y4);
+    }
+    return y;
+}
+
+inline double det_root9(double x) {
+    if (x <= 0.0) return 0.0;
+    double y = x > 1.0 ? 1.0 + (x - 1.0) / 9.0 : 1.0;
+    for (int i = 0; i < 12; i++) {
+        double y2 = y * y;
+        double y4 = y2 * y2;
+        double y8 = y4 * y4;
+        y = (8.0 * y + x / y8) / 9.0;
+    }
+    return y;
+}
+
+inline double det_pow_five_ninths(double x) {
+    double root9 = det_root9(x);
+    double root9_2 = root9 * root9;
+    double root9_4 = root9_2 * root9_2;
+    return root9_4 * root9;
+}
+
+inline double det_quarter_power(double x) {
+    return x <= 0.0 ? 0.0 : det_sqrt(det_sqrt(x));
+}
+
+inline double det_three_quarter_power(double x) {
+    return x <= 0.0 ? 0.0 : det_sqrt(det_sqrt(x * x * x));
+}
+
+inline double det_cbrt(double x) {
+    if (x == 0.0) return 0.0;
+
+    double ax = det_abs(x);
+    uint64_t bits = 0;
+    std::memcpy(&bits, &ax, sizeof(bits));
+    int exp = (int)((bits >> 52) & 0x7ff) - 1023;
+
+    if (exp == -1023) {
+        ax *= det_pow2_int(54);
+        std::memcpy(&bits, &ax, sizeof(bits));
+        exp = (int)((bits >> 52) & 0x7ff) - 1023 - 54;
+    }
+
+    uint64_t mant_bits = (bits & 0x000fffffffffffffULL) | (1023ULL << 52);
+    double m = 0.0;
+    std::memcpy(&m, &mant_bits, sizeof(m));
+
+    int q = exp / 3;
+    int rem = exp - 3 * q;
+    if (rem < 0) {
+        q--;
+        rem += 3;
+    }
+
+    double scaled = m * det_pow2_int(rem);
+    double y = 1.0 + (scaled - 1.0) / 3.0;
+    for (int i = 0; i < 8; i++) {
+        y = (2.0 * y + scaled / (y * y)) / 3.0;
+    }
+
+    double result = y * det_pow2_int(q);
+    return x < 0.0 ? -result : result;
+}
+
+inline double det_mobility(double K1, double S9) {
+    double num = det_root5(1.0 + K1);
+    double den_base = det_root5(1.0 + S9);
+    double den2 = den_base * den_base;
+    double den4 = den2 * den2;
+    double den8 = den4 * den4;
+    double den9 = den8 * den_base;
+    return den9 > 0.0 ? num / den9 : 0.0;
+}
+
+inline double det_wrap_half_pi(double x, bool& cos_flip) {
+    static const double TWO_PI = 6.28318530717958647692;
+    static const double HALF_PI = 1.57079632679489661923;
+
+    int64_t turns = (int64_t)(x / TWO_PI + (x >= 0.0 ? 0.5 : -0.5));
+    x -= (double)turns * TWO_PI;
+    cos_flip = false;
+
+    if (x > HALF_PI) {
+        x = PI - x;
+        cos_flip = true;
+    } else if (x < -HALF_PI) {
+        x = -PI - x;
+        cos_flip = true;
+    }
+    return x;
+}
+
+inline double det_wrap_pi(double x) {
+    static const double TWO_PI = 6.28318530717958647692;
+    int64_t turns = (int64_t)(x / TWO_PI + (x >= 0.0 ? 0.5 : -0.5));
+    return x - (double)turns * TWO_PI;
+}
+
+inline double det_sin(double x) {
+    bool cos_flip = false;
+    x = det_wrap_half_pi(x, cos_flip);
+    double x2 = x * x;
+    double x3 = x2 * x;
+    double x5 = x3 * x2;
+    double x7 = x5 * x2;
+    double x9 = x7 * x2;
+    return x - (x3 * 0.16666666666666666667)
+             + (x5 * 0.00833333333333333333)
+             - (x7 * 0.00019841269841269841)
+             + (x9 * 0.00000275573192239859);
+}
+
+inline double det_cos(double x) {
+    bool flip = false;
+    x = det_wrap_half_pi(x, flip);
+    double x2 = x * x;
+    double x4 = x2 * x2;
+    double x6 = x4 * x2;
+    double x8 = x6 * x2;
+    double y = 1.0 - (x2 * 0.5)
+             + (x4 * 0.04166666666666666667)
+             - (x6 * 0.00138888888888888889)
+             + (x8 * 0.00002480158730158730);
+    return flip ? -y : y;
+}
+
+inline double det_acos(double x) {
+    if (x <= -1.0) return PI;
+    if (x >= 1.0) return 0.0;
+
+    double ax = det_abs(x);
+    double seed = (((-0.0187293 * ax + 0.0742610) * ax - 0.2121144) * ax + 1.5707288)
+                * det_sqrt(1.0 - ax);
+    double theta = x < 0.0 ? PI - seed : seed;
+
+    for (int i = 0; i < 4; i++) {
+        double s = det_sin(theta);
+        if (det_abs(s) <= 1e-14) break;
+        theta += (det_cos(theta) - x) / s;
+        if (theta < 0.0) theta = 0.0;
+        if (theta > PI) theta = PI;
+    }
+    return theta;
+}
+
+inline double det_complex_abs(const std::complex<double>& z) {
+    return det_sqrt(std::norm(z));
+}
 
 // =============================================================================
 // LAYER 0 -- AXIOMS
@@ -240,8 +475,11 @@ DerivedConstants derive_all(const Axioms& ax) {
     d.f_univ = 1.0 / d.dt_univ;
     d.zeta = d.n_directed / (4.0 * PI * d.L_max);
     d.J_per_bit_eq = (double)d.N_bit_eq * ax.k_B * ax.T_substrate * std::log(2.0);
-    d.mu_M_FPM = (2.0 / 3.0) * d.zeta / ((d.alpha_PP + 9.0) * std::pow((double)d.N_bit_eq, 4));
-    d.G_FPM = d.mu_M_FPM * d.zeta * std::pow(ax.c_light, 4) * d.dx_univ / d.J_per_bit_eq;
+    double N_bit = (double)d.N_bit_eq;
+    double N_bit_2 = N_bit * N_bit;
+    double c2 = ax.c_light * ax.c_light;
+    d.mu_M_FPM = (2.0 / 3.0) * d.zeta / ((d.alpha_PP + 9.0) * N_bit_2 * N_bit_2);
+    d.G_FPM = d.mu_M_FPM * d.zeta * c2 * c2 * d.dx_univ / d.J_per_bit_eq;
     return d;
 }
 
@@ -258,10 +496,7 @@ struct Daemon {
     double tau;
     double pi_val;      // "pi" conflicts with M_PI
     double Omega_prev;
-    // Z^3 spatial coordinate (derived from flat index, not stored per-tick)
-    int coord_x, coord_y, coord_z;
     // Thermodynamic scheduling state
-    double accumulated_lag;
     int    local_tick_count;
     bool   is_active;
 };
@@ -286,7 +521,7 @@ public:
 
         // Operating-point Omega for initialization
         double e_t_op = 0.75;
-        double kappa_op = 1.0 * std::pow(e_t_op, 0.25);
+        double kappa_op = det_quarter_power(e_t_op);
         double Omega_op = d.Omega_max - (d.Omega_max - d.Omega_min) * kappa_op;
 
         std::normal_distribution<double> n01(0.0, 1.0);
@@ -299,7 +534,7 @@ public:
                     // Initialize psi to uniform normalized carrier
                     for (int ch = 0; ch < 9; ch++) {
                         double p_L = std::max(0.0, std::min(1.0, 0.5 + 0.005 * n01(rng)));
-                        double re = std::sqrt(p_L / 5.0);
+                        double re = det_sqrt(p_L / 5.0);
                         dm.psi[ch] = std::complex<double>(re, 0.0);
                     }
                     // Normalize psi
@@ -313,10 +548,6 @@ public:
                     dm.tau = 0.5;
                     dm.pi_val = std::max(0.0, std::min(1.0, 0.5 + 0.005 * n01(rng)));
                     dm.Omega_prev = Omega_op;
-                    dm.coord_x = x;
-                    dm.coord_y = y;
-                    dm.coord_z = z;
-                    dm.accumulated_lag = 0.0;
                     dm.local_tick_count = 0;
                     dm.is_active = true;
                 }
@@ -357,13 +588,11 @@ public:
         int dx = std::abs(x1 - x2); dx = std::min(dx, sx - dx);
         int dy = std::abs(y1 - y2); dy = std::min(dy, sy - dy);
         int dz = std::abs(z1 - z2); dz = std::min(dz, sz - dz);
-        return std::sqrt((double)(dx*dx + dy*dy + dz*dz));
+        return det_sqrt((double)(dx*dx + dy*dy + dz*dz));
     }
 
     // Inject baryonic cluster at center
     void inject_baryonic_cluster(int center_idx, double radius, double B_load, double E_inject) {
-        int cx = center_idx / (sy * sz), cyz = center_idx % (sy * sz);
-        int cy = cyz / sz, cz = cyz % sz;
         for (int i = 0; i < size(); i++) {
             double dist = euclidean_dist(i, center_idx);
             if (dist <= radius) {
@@ -379,7 +608,7 @@ private:
     void normalize_psi(Daemon& dm) {
         double norm = 0.0;
         for (int ch = 0; ch < 9; ch++) norm += std::norm(dm.psi[ch]);
-        norm = std::sqrt(norm);
+        norm = det_sqrt(norm);
         if (norm <= 0.0) {
             for (int ch = 0; ch < 9; ch++) dm.psi[ch] = std::complex<double>(1.0/3.0, 0.0);
             return;
@@ -433,15 +662,15 @@ inline double shear_aggregate(const double R[3][3]) {
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++)
             sum += R[i][j] * R[i][j];
-    return std::sqrt(sum / 9.0);
+    return det_sqrt(sum / 9.0);
 }
 
 inline double trace_curvature(const double R[3][3]) {
     return std::abs(R[0][0] + R[1][1] + R[2][2]);
 }
 
-inline double mobility(double K1, double S9, double alpha, double beta) {
-    return std::pow(1.0 + K1, alpha) / std::pow(1.0 + S9, beta);
+inline double mobility(double K1, double S9) {
+    return det_mobility(K1, S9);
 }
 
 void spectral_gap_weights(const double R[3][3], double& w_H, double& w_S) {
@@ -462,7 +691,6 @@ void spectral_gap_weights(const double R[3][3], double& w_H, double& w_S) {
     double cof = 0.0;
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 3; j++) {
-            int j2 = (j+1)%3, j3 = (j+2)%3;
             cof += RtR[i][j] * RtR[i][j]; // simplified
         }
     cof = 0.5 * (tr * tr - (RtR[0][0]*RtR[0][0] + RtR[0][1]*RtR[0][1] + RtR[0][2]*RtR[0][2]
@@ -476,20 +704,22 @@ void spectral_gap_weights(const double R[3][3], double& w_H, double& w_S) {
     double q = -2.0*tr*tr*tr/27.0 + tr*cof/3.0 - det;
     double disc = q*q/4.0 + p*p*p/27.0;
     if (disc > 0) {
-        double sq = std::sqrt(disc);
-        double u = std::cbrt(-q/2.0 + sq);
-        double v = std::cbrt(-q/2.0 - sq);
+        double sq = det_sqrt(disc);
+        double u = det_cbrt(-q/2.0 + sq);
+        double v = det_cbrt(-q/2.0 - sq);
         sigmas[0] = u + v + tr/3.0;
         // For the remaining eigenvalues, use simplified approximation
         sigmas[1] = std::max(1e-30, (tr - sigmas[0]) / 2.0);
         sigmas[2] = std::max(1e-30, tr - sigmas[0] - sigmas[1]);
     } else {
         // All real roots
-        double m = 2.0 * std::sqrt(-p/3.0);
-        double theta = std::acos(3.0*q/(p*m)) / 3.0;
-        sigmas[0] = m * std::cos(theta) + tr/3.0;
-        sigmas[1] = m * std::cos(theta - 2.0*PI/3.0) + tr/3.0;
-        sigmas[2] = m * std::cos(theta - 4.0*PI/3.0) + tr/3.0;
+        double m = 2.0 * det_sqrt(-p/3.0);
+        double acos_arg = (p != 0.0 && m != 0.0) ? 3.0*q/(p*m) : 1.0;
+        acos_arg = std::max(-1.0, std::min(1.0, acos_arg));
+        double theta = det_acos(acos_arg) / 3.0;
+        sigmas[0] = m * det_cos(theta) + tr/3.0;
+        sigmas[1] = m * det_cos(theta - 2.0*PI/3.0) + tr/3.0;
+        sigmas[2] = m * det_cos(theta - 4.0*PI/3.0) + tr/3.0;
     }
     // Sort descending
     std::sort(sigmas, sigmas + 3, std::greater<double>());
@@ -504,7 +734,7 @@ inline double normalized_entropy_H(const double p[2]) {
     double pp[2] = {std::max(p[0], 1e-12), std::max(p[1], 1e-12)};
     double s = pp[0] + pp[1];
     pp[0] /= s; pp[1] /= s;
-    double H = -(pp[0] * std::log(pp[0]) + pp[1] * std::log(pp[1])) / std::log(2.0);
+    double H = -(pp[0] * det_log2(pp[0]) + pp[1] * det_log2(pp[1]));
     return H;
 }
 
@@ -541,7 +771,7 @@ double dispersion(const Daemon& dm) {
     std::complex<double> c(0,0);
     for (int i = 0; i < 4; i++) c += dm.psi[i] * std::conj(dm.psi[5+i]);
     c /= 4.0;
-    return 2.0 * std::abs(c);
+    return 2.0 * det_complex_abs(c);
 }
 
 void viscosity_update(const Daemon& dm, const DerivedConstants& d,
@@ -553,10 +783,10 @@ void viscosity_update(const Daemon& dm, const DerivedConstants& d,
     spectral_gap_weights(dm.R, w_H, w_S);
     double A_N = w_H * H + w_S * S;
     C_N = std::min(A_N, 1.0);
-    double e_B = std::max(std::pow(1.0 + B_load, d.e_exp), d.e_floor);
+    double e_B = std::max(1.0 / det_three_quarter_power(1.0 + B_load), d.e_floor);
     double e_t = (dm.E / d.E_max) * e_B;
     e_t = std::max(0.0, std::min(1.0, e_t));
-    double g_e = std::pow(e_t, d.chi_arrow);
+    double g_e = det_quarter_power(e_t);
     kappa = C_N * g_e;
     kappa = std::max(0.0, std::min(1.0, kappa));
     double dOmega = d.Omega_max - d.Omega_min;
@@ -587,7 +817,7 @@ double axcore_lagrangian(const Daemon& dm, const DerivedConstants& d,
     C_sem_out = d.c0 + cfg.w_D * Bdt + cfg.w_I * (1.0 - f);
 
     double gap = std::abs(p[0] - dm.tau);
-    C_geo_out = cfg.w_T * gap + cfg.w_A * std::pow(dm.b, 1.0) * std::abs(dm.pi_val - dm.tau);
+    C_geo_out = cfg.w_T * gap + cfg.w_A * dm.b * std::abs(dm.pi_val - dm.tau);
 
     double dOmega = std::abs(Omega_new - dm.Omega_prev);
     smooth_out = d.lam * dOmega;
@@ -597,12 +827,93 @@ double axcore_lagrangian(const Daemon& dm, const DerivedConstants& d,
     return L;
 }
 
-// Thermodynamic Scheduler: priority queue, daemons buy ticks with FPM currency
+// Thermodynamic Scheduler: radix heap, daemons buy quantized ticks with FPM currency
+static constexpr uint64_t ACTION_STEPS_PER_UNIVERSAL_TICK = 1000000ULL;
+
 struct SchedulerEvent {
-    double next_time;
+    uint64_t next_step;
     int    flat_idx;
-    bool operator>(const SchedulerEvent& other) const {
-        return next_time > other.next_time; // min-heap
+};
+
+class RadixHeap {
+public:
+    RadixHeap() : last_step_(0), total_size_(0) {}
+
+    bool empty() const {
+        return total_size_ == 0;
+    }
+
+    size_t size() const {
+        return total_size_;
+    }
+
+    void push(const SchedulerEvent& ev) {
+        assert(ev.next_step >= last_step_ && "Causal violation: time moved backward");
+        buckets_[bucket_index(ev.next_step)].push_back(ev);
+        total_size_++;
+    }
+
+    SchedulerEvent pop() {
+        assert(total_size_ > 0 && "Pop from empty scheduler");
+
+        if (buckets_[0].empty()) {
+            int source_bucket = 1;
+            while (source_bucket < 65 && buckets_[source_bucket].empty()) {
+                source_bucket++;
+            }
+            assert(source_bucket < 65 && "Radix heap size counter drifted");
+
+            uint64_t min_step = std::numeric_limits<uint64_t>::max();
+            int min_flat_idx = std::numeric_limits<int>::max();
+            for (const auto& ev : buckets_[source_bucket]) {
+                if (ev.next_step < min_step ||
+                    (ev.next_step == min_step && ev.flat_idx < min_flat_idx)) {
+                    min_step = ev.next_step;
+                    min_flat_idx = ev.flat_idx;
+                }
+            }
+
+            last_step_ = min_step;
+
+            std::vector<SchedulerEvent> cracked = std::move(buckets_[source_bucket]);
+            buckets_[source_bucket].clear();
+            for (const auto& ev : cracked) {
+                buckets_[bucket_index(ev.next_step)].push_back(ev);
+            }
+        }
+
+        auto best_it = buckets_[0].begin();
+        for (auto it = buckets_[0].begin() + 1; it != buckets_[0].end(); ++it) {
+            if (it->flat_idx < best_it->flat_idx) {
+                best_it = it;
+            }
+        }
+
+        SchedulerEvent result = *best_it;
+        *best_it = buckets_[0].back();
+        buckets_[0].pop_back();
+        total_size_--;
+        return result;
+    }
+
+private:
+    std::vector<SchedulerEvent> buckets_[65];
+    uint64_t last_step_;
+    size_t total_size_;
+
+    static int highest_differing_bit(uint64_t value) {
+#if defined(_MSC_VER)
+        unsigned long index = 0;
+        _BitScanReverse64(&index, value);
+        return (int)index + 1;
+#else
+        return 64 - __builtin_clzll(value);
+#endif
+    }
+
+    int bucket_index(uint64_t step) const {
+        uint64_t diff = step ^ last_step_;
+        return diff == 0 ? 0 : highest_differing_bit(diff);
     }
 };
 
@@ -611,24 +922,23 @@ public:
     Z3Lattice& lattice;
     const DerivedConstants& d;
     LagrangianConfig cfg;
-    double universal_time;
-    std::priority_queue<SchedulerEvent, std::vector<SchedulerEvent>,
-                        std::greater<SchedulerEvent>> heap;
+    uint64_t universal_step;
+    RadixHeap heap;
 
     ThermodynamicScheduler(Z3Lattice& lat, const DerivedConstants& dc)
-        : lattice(lat), d(dc), universal_time(0.0)
+        : lattice(lat), d(dc), universal_step(0)
     {
         for (int i = 0; i < lattice.size(); i++) {
-            heap.push({0.0, i});
+            heap.push({0, i});
         }
     }
 
-    // Step one daemon: pop from priority queue, execute, re-schedule
+    // Step one daemon: pop from radix heap, execute, re-schedule
     bool step_one(double& L_out, double& O_out, double& k_out) {
         if (heap.empty()) return false;
-        auto ev = heap.top(); heap.pop();
+        SchedulerEvent ev = heap.pop();
         Daemon& dm = lattice.arena[ev.flat_idx];
-        universal_time = std::max(universal_time, ev.next_time);
+        universal_step = std::max(universal_step, ev.next_step);
 
         if (!dm.is_active) return false;
 
@@ -656,12 +966,13 @@ public:
             double rc_weight = std::abs(dm.R[ch/3][ch%3]);
             if (rc_weight <= 0) rc_weight = 1.0;
             double L_ch = L_out * rc_weight;
-            dm.psi[ch] *= std::exp(std::complex<double>(0, -theta * L_ch));
+            double angle = theta * L_ch;
+            dm.psi[ch] *= std::complex<double>(det_cos(angle), -det_sin(angle));
         }
         // Renormalize psi
         double norm = 0;
         for (int ch = 0; ch < 9; ch++) norm += std::norm(dm.psi[ch]);
-        norm = std::sqrt(norm);
+        norm = det_sqrt(norm);
         if (norm > 0) for (int ch = 0; ch < 9; ch++) dm.psi[ch] /= norm;
 
         dm.Omega_prev = O_out;
@@ -673,22 +984,22 @@ public:
         // Rebuild psi from binary probabilities (preserve phases)
         std::complex<double> phases[9];
         for (int ch = 0; ch < 9; ch++) {
-            double amp = std::abs(dm.psi[ch]);
+            double amp = det_complex_abs(dm.psi[ch]);
             phases[ch] = (amp > 0) ? dm.psi[ch] / amp : std::complex<double>(1,0);
         }
         double p_r_val = 1.0 - new_p_L;
-        for (int ch = 0; ch < 5; ch++) dm.psi[ch] = phases[ch] * std::sqrt(new_p_L / 5.0);
-        for (int ch = 5; ch < 9; ch++) dm.psi[ch] = phases[ch] * std::sqrt(p_r_val / 4.0);
+        for (int ch = 0; ch < 5; ch++) dm.psi[ch] = phases[ch] * det_sqrt(new_p_L / 5.0);
+        for (int ch = 5; ch < 9; ch++) dm.psi[ch] = phases[ch] * det_sqrt(p_r_val / 4.0);
         // Renormalize
         norm = 0;
         for (int ch = 0; ch < 9; ch++) norm += std::norm(dm.psi[ch]);
-        norm = std::sqrt(norm);
+        norm = det_sqrt(norm);
         if (norm > 0) for (int ch = 0; ch < 9; ch++) dm.psi[ch] /= norm;
 
         // R evolution
         double K1 = trace_curvature(dm.R);
         double S9 = shear_aggregate(dm.R);
-        double phi = mobility(K1, S9, d.alpha, d.beta);
+        double phi = mobility(K1, S9);
         std::normal_distribution<double> n01(0.0, 1.0);
         for (int i = 0; i < 3; i++)
             for (int j = 0; j < 3; j++)
@@ -706,26 +1017,27 @@ public:
         dm.local_tick_count++;
         if (dm.E <= 0.0) dm.is_active = false;
 
-        // Re-schedule: next execution at next_time + period
+        // Re-schedule on the integer action lattice. Route cost still determines
+        // the period, but the global event ledger advances only in fixed quanta.
         double L_clamped = std::max(d.L_rest, std::min(d.L_max, L_out));
-        double period = (L_clamped / d.L_rest) * d.dt_univ;
-        heap.push({ev.next_time + period, ev.flat_idx});
+        uint64_t period_steps = period_to_steps(L_clamped);
+        heap.push({ev.next_step + period_steps, ev.flat_idx});
 
         return true;
     }
 
-    // Run batch: process events until universal_time reaches target
+    // Run batch: process events until the quantized universal ledger reaches target
     void run_batch(int n_universal_ticks,
                    std::vector<double>& t_hist,
                    std::vector<double>& total_E_hist,
                    std::vector<double>& mean_L_hist,
                    std::vector<double>& mean_Omega_hist,
                    std::vector<double>& active_frac_hist) {
-        double target_time = n_universal_ticks * d.dt_univ;
+        uint64_t target_step = (uint64_t)n_universal_ticks * ACTION_STEPS_PER_UNIVERSAL_TICK;
         int events = 0;
         int sample_every = lattice.size();
 
-        while (universal_time < target_time && !heap.empty()) {
+        while (universal_step < target_step && !heap.empty()) {
             double L, O, k;
             step_one(L, O, k);
             events++;
@@ -752,7 +1064,7 @@ public:
                     }
                 }
                 int n = lattice.size();
-                t_hist.push_back(universal_time / d.dt_univ);
+                t_hist.push_back((double)universal_step / (double)ACTION_STEPS_PER_UNIVERSAL_TICK);
                 total_E_hist.push_back(total_E);
                 mean_L_hist.push_back(active > 0 ? sum_L / active : 0);
                 mean_Omega_hist.push_back(active > 0 ? sum_O / active : 0);
@@ -781,7 +1093,7 @@ public:
                 mean_R /= 9.0;
                 for (int ii = 0; ii < 3; ii++)
                     for (int jj = 0; jj < 3; jj++) std_R += (dm.R[ii][jj] - mean_R) * (dm.R[ii][jj] - mean_R);
-                std_R = std::sqrt(std_R / 9.0);
+                std_R = det_sqrt(std_R / 9.0);
                 double w = eta_flux * std_R + eta_geo * std::abs(dm.pi_val - nbr.pi_val);
                 w = std::max(1e-9, w);
                 w_sum += w;
@@ -800,6 +1112,12 @@ public:
 
 private:
     double C_N_unused;
+
+    uint64_t period_to_steps(double L_clamped) const {
+        double universal_ticks = L_clamped / d.L_rest;
+        double quantized = std::round(universal_ticks * (double)ACTION_STEPS_PER_UNIVERSAL_TICK);
+        return std::max<uint64_t>(1, (uint64_t)quantized);
+    }
 };
 
 // =============================================================================
@@ -822,7 +1140,7 @@ struct EmergentProbeBorn {
             for (int ch = 0; ch < 9; ch++) psi[ch] = std::complex<double>(n01(rng), n01(rng));
             double norm = 0;
             for (int ch = 0; ch < 9; ch++) norm += std::norm(psi[ch]);
-            norm = std::sqrt(norm);
+            norm = det_sqrt(norm);
             for (int ch = 0; ch < 9; ch++) psi[ch] /= norm;
 
             // Born probabilities
@@ -837,7 +1155,7 @@ struct EmergentProbeBorn {
             int64_t floor_sum = 0;
             for (int ch = 0; ch < 9; ch++) {
                 expected[ch] = p_born[ch] * (double)d.N_bit_eq;
-                floors[ch] = (int64_t)std::floor(expected[ch]);
+                floors[ch] = (int64_t)expected[ch];
                 floor_sum += floors[ch];
             }
             int64_t remaining = d.N_bit_eq - floor_sum;
@@ -874,7 +1192,7 @@ struct EmergentProbeBell {
         double A[3][3] = {{0,0,0},{0,0,-scale},{0,scale,0}};
         // Relative rotation
         double delta = a - b;
-        double cs = std::cos(delta), sn = std::sin(delta);
+        double cs = det_cos(delta), sn = det_sin(delta);
         double R_rel[3][3] = {{cs,-sn,0},{sn,cs,0},{0,0,1}};
         // A_eff = R_rel * A * R_rel^T
         double AR[3][3] = {}, A_eff[3][3] = {};
@@ -897,12 +1215,12 @@ struct EmergentProbeBell {
     }
 
     double local_torsion_correlation(double a, double b) const {
-        double delta = std::abs(std::fmod(a - b + PI, 2*PI) - PI);
+        double delta = det_abs(det_wrap_pi(a - b));
         return -1.0 + 2.0 * delta / PI;
     }
 
     double qm_correlation(double a, double b) const {
-        return -std::cos(a - b);
+        return -det_cos(a - b);
     }
 
     double joint_torsion_lrm_correlation(double a, double b) const {
@@ -916,7 +1234,7 @@ struct EmergentProbeBell {
         double expected[4]; int64_t floors[4]; int64_t floor_sum = 0;
         for (int i = 0; i < 4; i++) {
             expected[i] = p_joint[i] * (double)d.N_bit_eq;
-            floors[i] = (int64_t)std::floor(expected[i]);
+            floors[i] = (int64_t)expected[i];
             floor_sum += floors[i];
         }
         int64_t remaining = d.N_bit_eq - floor_sum;
@@ -946,7 +1264,7 @@ struct EmergentProbeBell {
         S_torsion = chsh_value([this](double a, double b){ return geometric_torsion_correlation(a,b); });
         S_joint   = chsh_value([this](double a, double b){ return joint_torsion_lrm_correlation(a,b); });
 
-        double tsirelson = 2.0 * std::sqrt(2.0);
+        double tsirelson = 2.0 * det_sqrt(2.0);
         verdict = (S_local <= 2.0 + 1e-9 && S_joint > 2.0
                    && std::abs(S_joint - tsirelson) < 0.01) ? "PASS" : "FAIL";
     }
@@ -958,8 +1276,7 @@ struct EmergentProbeFineStructure {
     EmergentProbeFineStructure(const DerivedConstants& dc) : d(dc) {}
 
     void run(double& one_over_alpha_bare, double& rel_diff, std::string& verdict) {
-        double C_sym_max = std::pow(1.0 / d.e_floor, 1.0 / d.beta);
-        double alpha_bare = d.c0 / C_sym_max;
+        double C_sym_max = det_pow_five_ninths(1.0 / d.e_floor);
         one_over_alpha_bare = C_sym_max / d.c0;
         double codata_inv = 137.035999084;
         rel_diff = std::abs(one_over_alpha_bare - codata_inv) / codata_inv;
@@ -1086,14 +1403,14 @@ struct CalibrationResult {
     double N_bit_eq_continuous;
 };
 
-CalibrationResult calibrate(const DerivedConstants& d, const Axioms& ax) {
+CalibrationResult calibrate(const DerivedConstants& d) {
     CalibrationResult c;
     c.rel_err_G = std::abs(d.G_FPM - G_CODATA) / G_CODATA;
     c.rel_err_ns = std::abs(d.n_s - PLANCK_NS) / PLANCK_NS;
     c.ell_D_in_range = (1100.0 <= d.ell_D && d.ell_D <= 1500.0);
     c.gamma_above_cern = (d.gamma_max > CERN_MUON_GAMMA);
     c.N_bit_eq_exact = d.N_bit_eq;
-    c.N_bit_eq_continuous = (4.0 * PI / 3.0) * std::pow(d.alpha_PP, 3);
+    c.N_bit_eq_continuous = (4.0 * PI / 3.0) * d.alpha_PP * d.alpha_PP * d.alpha_PP;
     return c;
 }
 
@@ -1124,7 +1441,7 @@ void write_json(const std::string& path,
     f << std::setprecision(15);
     f << "{\n";
     f << "  \"metadata\": { \"version\": \"v7.0-axcore-cpp\", "
-       << "\"architecture\": \"Z^3 flat arena + priority_queue scheduler + emergent probes\" },\n";
+       << "\"architecture\": \"Z^3 flat arena + radix heap scheduler + emergent probes\" },\n";
 
     // Axioms
     f << "  \"axioms\": { \"dim_space\": " << ax.dim_space
@@ -1175,7 +1492,7 @@ void write_json(const std::string& path,
       << ", \"verdict\": \"" << born_verdict << "\" },\n";
     f << "    \"bell\": { \"S_local\": " << S_local << ", \"S_qm\": " << S_qm
       << ", \"S_torsion\": " << S_torsion << ", \"S_joint\": " << S_joint
-      << ", \"tsirelson\": " << 2.0*std::sqrt(2.0)
+      << ", \"tsirelson\": " << 2.0*det_sqrt(2.0)
       << ", \"verdict\": \"" << bell_verdict << "\" },\n";
     f << "    \"fine_structure\": { \"one_over_alpha_bare\": " << fs_one_over
       << ", \"rel_diff_from_macro\": " << fs_rel_diff
@@ -1219,7 +1536,7 @@ int main() {
     std::cout << "========================================================================\n";
     std::cout << "FINITE POSSIBILITY MECHANICS v7.0-axcore-cpp -- EMERGENT LATTICE SIMULATOR\n";
     std::cout << "========================================================================\n\n";
-    std::cout << "Architecture: flat memory arena + bitwise Z^3 adjacency + priority_queue\n";
+    std::cout << "Architecture: flat memory arena + bitwise Z^3 adjacency + radix heap scheduler\n";
     std::cout << "  (No bridge equations. The universe computes itself.)\n\n";
 
     // Layer 0
@@ -1246,7 +1563,7 @@ int main() {
 
     // Calibration
     std::cout << "Layer 7: Calibration check...\n";
-    CalibrationResult cal = calibrate(d, ax);
+    CalibrationResult cal = calibrate(d);
     std::cout << "  G_FPM vs CODATA: " << cal.rel_err_G*100 << "%\n";
     std::cout << "  n_s vs Planck: " << cal.rel_err_ns*100 << "%\n";
     std::cout << "  ell_D in range: " << (cal.ell_D_in_range ? "YES" : "NO") << "\n";
@@ -1265,9 +1582,9 @@ int main() {
     std::cout << "  6-face Z^3 adjacency via flat-index modulo arithmetic\n\n";
 
     // Layer 4: Thermodynamic Scheduler
-    std::cout << "Layer 4: Initializing thermodynamic scheduler (std::priority_queue)...\n";
+    std::cout << "Layer 4: Initializing thermodynamic scheduler (radix heap)...\n";
     ThermodynamicScheduler sched(lattice, d);
-    std::cout << "  Priority queue: " << sched.heap.size() << " entries\n";
+    std::cout << "  Radix heap: " << sched.heap.size() << " entries\n";
     std::cout << "  Tick period: dt_local = (L_t / L_rest) * dt_univ\n\n";
 
     // Run batch
@@ -1284,7 +1601,7 @@ int main() {
     double mean_ticks = std::accumulate(tick_counts.begin(), tick_counts.end(), 0.0) / lattice.size();
     double std_ticks = 0;
     for (int tc : tick_counts) std_ticks += (tc - mean_ticks) * (tc - mean_ticks);
-    std_ticks = std::sqrt(std_ticks / lattice.size());
+    std_ticks = det_sqrt(std_ticks / lattice.size());
     std::cout << "  Tick count range: [" << *std::min_element(tick_counts.begin(), tick_counts.end())
               << ", " << *std::max_element(tick_counts.begin(), tick_counts.end()) << "]\n";
     std::cout << "  Tick count std: " << std_ticks << " (thermodynamic spread)\n\n";
@@ -1306,7 +1623,7 @@ int main() {
     double S_local, S_qm, S_torsion, S_joint; std::string bell_verdict;
     bell_probe.run(S_local, S_qm, S_torsion, S_joint, bell_verdict);
     std::cout << "    S_local: " << S_local << " S_joint: " << S_joint
-              << " Tsirelson: " << 2*std::sqrt(2.0) << " Verdict: " << bell_verdict << "\n";
+              << " Tsirelson: " << 2*det_sqrt(2.0) << " Verdict: " << bell_verdict << "\n";
 
     // Fine structure
     std::cout << "  [Fine structure] Torsion snap at UV cutoff...\n";
@@ -1360,7 +1677,7 @@ int main() {
     std::cout << "FPM v7.0-axcore-cpp emergent lattice simulation complete.\n\n";
     std::cout << "Architectural summary:\n";
     std::cout << "  OLD: Python objects + 1D ring + uniform loop + bridge equation\n";
-    std::cout << "  NEW: flat arena + Z^3 modulo + priority_queue + emergent probe\n\n";
+    std::cout << "  NEW: flat arena + Z^3 modulo + radix heap + emergent probe\n\n";
     std::cout << "  The substrate BUILDS the universe.\n";
     std::cout << "  The scheduler ENFORCES the thermodynamic law.\n";
     std::cout << "  The probes MEASURE what emerges.\n";
