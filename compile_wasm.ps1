@@ -10,14 +10,14 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Root = $PSScriptRoot
-$Source = Join-Path $Root "src\fpm_axcore_simulator.cpp"
+$Sources = Get-ChildItem -Path (Join-Path $Root "src") -Filter "*.cpp" | Select-Object -ExpandProperty FullName
 $OutDir = Join-Path $Root "web"
 $OutJs = Join-Path $OutDir "fpm_axcore.js"
 $OutWasm = Join-Path $OutDir "fpm_axcore.wasm"
 $EmsdkEnv = Join-Path $EmsdkPath "emsdk_env.bat"
 
-if (!(Test-Path $Source)) {
-    throw "Source file not found: $Source"
+if ($Sources.Count -eq 0) {
+    throw "No C++ source files found in src/"
 }
 
 if (!(Test-Path $EmsdkEnv)) {
@@ -34,6 +34,7 @@ Write-Host "Building FPM AxCore simulator for WebAssembly..."
 
 $compileArgs = @(
     $Optimization,
+    "-flto",
     "-std=c++17",
     "-Wall",
     "-Wextra",
@@ -43,9 +44,9 @@ $compileArgs = @(
     "-s", "EXIT_RUNTIME=1",
     "-s", "NODERAWFS=1",
     "-s", "ENVIRONMENT=web,node",
-    "-o", $OutJs,
-    $Source
+    "-o", $OutJs
 )
+$compileArgs += $Sources
 
 $quotedArgs = ($compileArgs | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join " "
 $cmd = "`"$EmsdkEnv`" >nul && em++ $quotedArgs"

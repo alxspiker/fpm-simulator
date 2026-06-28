@@ -36,7 +36,7 @@ from typing import Iterable, Iterator
 
 
 ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src" / "fpm_axcore_simulator.cpp"
+SRC_DIR = ROOT / "src"
 COMPILE_SCRIPT = ROOT / "compile_and_run.ps1"
 ARTIFACT_DIR = ROOT / "artifacts"
 RESULTS_JSON = ARTIFACT_DIR / "fpm_axcore_results.json"
@@ -296,7 +296,7 @@ def fit_scaled_rmse(v_obs: list[float], v_raw: list[float]) -> tuple[float, floa
 
 def launch_cpp_with_runtime(args: list[str], *, timeout: int = 180) -> subprocess.CompletedProcess[str]:
     quoted_args = " ".join(f"'{arg}'" for arg in args)
-    ps_command = "$env:Path='C:\\msys64\\mingw64\\bin;' + $env:Path; & " + quoted_args
+    ps_command = f"Unblock-File -Path '{args[0]}' -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500; $env:Path='C:\\msys64\\mingw64\\bin;' + $env:Path; & {quoted_args}"
     return run_command(["powershell", "-NoProfile", "-Command", ps_command], timeout=timeout)
 
 
@@ -407,9 +407,12 @@ def check_artifacts() -> list[Check]:
 
 
 def check_source_architecture() -> list[Check]:
-    source = SRC.read_text(encoding="utf-8", errors="replace")
+    source_files = list(SRC_DIR.glob("*.cpp")) + list(SRC_DIR.glob("*.hpp"))
+    source = ""
+    for f in source_files:
+        source += f.read_text(encoding="utf-8", errors="replace") + "\n"
     checks = [
-        Check("source file exists", SRC.exists(), str(SRC.relative_to(ROOT))),
+        Check("src directory exists and contains source files", SRC_DIR.exists() and len(source_files) > 0, str(SRC_DIR.relative_to(ROOT))),
         Check("radix heap scheduler present", "class RadixHeap" in source and "RadixHeap heap;" in source),
         Check("std::priority_queue removed", "std::priority_queue" not in source and "#include <queue>" not in source),
         Check("integer scheduler timestamps", "uint64_t next_step" in source and "uint64_t universal_step" in source),

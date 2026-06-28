@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Root = $PSScriptRoot
-$Source = Join-Path $Root "src\fpm_axcore_simulator.cpp"
+$Sources = Get-ChildItem -Path (Join-Path $Root "src") -Filter "*.cpp" | Select-Object -ExpandProperty FullName
 $BuildDir = Join-Path $Root "build"
 $Exe = Join-Path $BuildDir "fpm_axcore.exe"
 
@@ -46,8 +46,8 @@ function Find-Tool {
     return $null
 }
 
-if (!(Test-Path $Source)) {
-    throw "Source file not found: $Source"
+if ($Sources.Count -eq 0) {
+    throw "No C++ source files found in src/"
 }
 
 if ($Clean -and (Test-Path $BuildDir)) {
@@ -78,14 +78,15 @@ if ($gpp) {
     }
     $args = @(
         "-O2",
+        "-flto",
         "-std=c++17",
         "-fopenmp",
         "-Wall",
         "-Wextra",
-        "-o", $Exe,
-        $Source,
-        "-lm"
+        "-o", $Exe
     )
+    $args += $Sources
+    $args += "-lm"
     Invoke-Checked $gpp $args
 }
 elseif ($clangpp) {
@@ -95,12 +96,13 @@ elseif ($clangpp) {
     }
     $args = @(
         "-O2",
+        "-flto",
         "-std=c++17",
         "-Wall",
         "-Wextra",
-        "-o", $Exe,
-        $Source
+        "-o", $Exe
     )
+    $args += $Sources
     Invoke-Checked $clangpp $args
 }
 elseif ($cl) {
@@ -111,11 +113,12 @@ elseif ($cl) {
         "/EHsc",
         "/std:c++17",
         "/O2",
+        "/GL",
         "/openmp",
         "/Fe:$Exe",
-        "/Fo:$objDir\",
-        $Source
+        "/Fo:$objDir\"
     )
+    $args += $Sources
     Invoke-Checked $cl $args
 }
 else {
@@ -123,6 +126,8 @@ else {
 }
 
 Write-Host "Built: $Exe"
+Unblock-File -Path $Exe -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 1
 
 if (!$SkipRun) {
     Write-Host "Running simulator..."
